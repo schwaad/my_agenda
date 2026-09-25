@@ -85,6 +85,7 @@ struct RawGoogleCalendarResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RawGoogleError {
     pub code: Option<u16>,
     pub message: Option<String>,
@@ -99,6 +100,7 @@ struct RawGoogleEventTime {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct RawGoogleEvent {
     pub id: String,
     pub summary: Option<String>,
@@ -111,13 +113,69 @@ struct RawGoogleEvent {
 }
 
 #[tauri::command]
+fn export_schedule_csv(content: String) -> Result<Option<String>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+
+        let output = Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--save",
+                "--confirm-overwrite",
+                "--title=Exportar cronograma",
+                "--filename=meu-cronograma.csv",
+                "--file-filter=Arquivos CSV | *.csv",
+            ])
+            .output()
+            .map_err(|error| format!("Não foi possível abrir o seletor de arquivos: {error}"))?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let selected = String::from_utf8(output.stdout)
+            .map_err(|error| format!("Caminho de arquivo inválido: {error}"))?;
+        let selected = selected.trim();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        let path = if selected.to_ascii_lowercase().ends_with(".csv") {
+            selected.to_string()
+        } else {
+            format!("{selected}.csv")
+        };
+        std::fs::write(&path, content)
+            .map_err(|error| format!("Erro ao salvar o cronograma: {error}"))?;
+        Ok(Some(path))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = content;
+        Err("O seletor nativo de exportação ainda não está disponível neste sistema.".into())
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    let trimmed = host.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        format!("https://{}", trimmed)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[tauri::command]
 async fn fetch_gitlab_issues(
     host: String,
     token: String,
     username: String,
 ) -> Result<Vec<GitlabIssue>, String> {
-    let clean_host = host.trim_end_matches('/');
-    if clean_host.is_empty() || token.is_empty() {
+    let clean_host = normalize_host(&host);
+    if clean_host.is_empty() || token.trim().is_empty() {
         return Err("Host ou Token do GitLab não fornecidos".into());
     }
 
@@ -127,7 +185,7 @@ async fn fetch_gitlab_issues(
     } else {
         format!(
             "{}/api/v4/issues?scope=all&assignee_username={}&state=opened&per_page=100",
-            clean_host, username.trim()
+            clean_host, urlencoding::encode(username.trim())
         )
     };
 
@@ -175,8 +233,8 @@ async fn fetch_gitlab_mrs(
     token: String,
     username: String,
 ) -> Result<Vec<GitlabMR>, String> {
-    let clean_host = host.trim_end_matches('/');
-    if clean_host.is_empty() || token.is_empty() {
+    let clean_host = normalize_host(&host);
+    if clean_host.is_empty() || token.trim().is_empty() {
         return Err("Host ou Token do GitLab não fornecidos".into());
     }
 
@@ -186,7 +244,7 @@ async fn fetch_gitlab_mrs(
     } else {
         format!(
             "{}/api/v4/merge_requests?scope=all&author_username={}&state=opened&per_page=100",
-            clean_host, username.trim()
+            clean_host, urlencoding::encode(username.trim())
         )
     };
 
@@ -300,6 +358,7 @@ async fn fetch_google_calendar_events(
     api_key_or_token: String,
     client_id: Option<String>,
     client_secret: Option<String>,
+    time_min: Option<String>,
 ) -> Result<Vec<GoogleEvent>, String> {
     let raw_token = api_key_or_token.trim();
     let clean_cal_id = if calendar_id.trim().is_empty() {
@@ -326,9 +385,14 @@ async fn fetch_google_calendar_events(
     let client = reqwest::Client::new();
     let encoded_cal_id = urlencoding::encode(&clean_cal_id);
 
+    // Filter from specified timeMin or 1 year ago so recent and future events are returned
+    let default_time_min = "2025-01-01T00:00:00Z".to_string();
+    let effective_time_min = time_min.unwrap_or(default_time_min);
+    let encoded_time_min = urlencoding::encode(&effective_time_min);
+
     let url = format!(
-        "https://www.googleapis.com/calendar/v3/calendars/{}/events?singleEvents=true&orderBy=startTime&maxResults=250",
-        encoded_cal_id
+        "https://www.googleapis.com/calendar/v3/calendars/{}/events?singleEvents=true&orderBy=startTime&maxResults=2500&timeMin={}",
+        encoded_cal_id, encoded_time_min
     );
 
     // If starts with "AIza", it's a Google API Key. Otherwise, it's an OAuth2 Bearer Token.
@@ -367,6 +431,7 @@ async fn fetch_google_calendar_events(
         .items
         .unwrap_or_default()
         .into_iter()
+        .filter(|item| item.status.as_deref() != Some("cancelled"))
         .map(|item| {
             let start = item
                 .start
@@ -526,6 +591,7 @@ async fn test_google_connection(
         api_key_or_token.clone(),
         client_id.clone(),
         client_secret.clone(),
+        None,
     ).await?;
 
     let tasks_msg = match fetch_google_tasks(api_key_or_token, client_id, client_secret).await {
@@ -871,8 +937,8 @@ fn parse_ical_date(s: &str) -> String {
 
 #[tauri::command]
 async fn test_gitlab_connection(host: String, token: String) -> Result<String, String> {
-    let clean_host = host.trim_end_matches('/');
-    if clean_host.is_empty() || token.is_empty() {
+    let clean_host = normalize_host(&host);
+    if clean_host.is_empty() || token.trim().is_empty() {
         return Err("Preencha o Host e o Token antes de testar.".into());
     }
 
@@ -917,6 +983,13 @@ mod urlencoding {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").is_err() {
+            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -925,7 +998,8 @@ pub fn run() {
             fetch_google_calendar_events,
             fetch_google_tasks,
             test_gitlab_connection,
-            test_google_connection
+            test_google_connection,
+            export_schedule_csv
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

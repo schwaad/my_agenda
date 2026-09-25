@@ -28,6 +28,12 @@ tokio = { version = "1", features = ["full"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.dev]
+# UI debugging uses Tauri DevTools and logs, so skip the large native symbol set.
+# Incremental compilation makes repeated local Rust builds faster.
+debug = 0
+incremental = true
+
 [profile.release]
 codegen-units = 1
 lto = true

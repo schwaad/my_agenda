@@ -1,5 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { renderMarkdown, gitlabProjectUrl } from './markdown.ts';
+import { setupNotes } from './notes.ts';
+import { setupTasks } from './tasks.ts';
+import { setupSchedule } from './schedule.ts';
+import { setupTimer } from './timer.ts';
 
 // Data Interfaces
 interface GoogleEvent {
@@ -53,7 +58,7 @@ interface AppConfig {
 
 // App State
 class AppState {
-  currentView: 'monthly' | 'weekly' | 'daily' | 'gitlab' = 'monthly';
+  currentView: 'monthly' | 'weekly' | 'daily' | 'schedule' | 'gitlab' | 'notes' | 'tasks' | 'timer' = 'monthly';
   currentDate: Date = new Date();
   config: AppConfig = {
     gitlabHost: '',
@@ -251,31 +256,43 @@ async function fetchAllData() {
     return;
   }
 
-  try {
-    // Fetch GitLab Issues & MRs
-    if (state.config.gitlabHost && state.config.gitlabToken) {
+  // Fetch GitLab Issues & MRs in isolated try/catch
+  if (state.config.gitlabHost && state.config.gitlabToken) {
+    try {
       const issues = await invoke<GitlabIssue[]>('fetch_gitlab_issues', {
         host: state.config.gitlabHost,
         token: state.config.gitlabToken,
-        username: state.config.gitlabUsername,
+        username: state.config.gitlabUsername || '',
       });
       state.gitlabIssues = issues;
+    } catch (err) {
+      console.error('Erro ao buscar Issues do GitLab:', err);
+    }
 
+    try {
       const mrs = await invoke<GitlabMR[]>('fetch_gitlab_mrs', {
         host: state.config.gitlabHost,
         token: state.config.gitlabToken,
-        username: state.config.gitlabUsername,
+        username: state.config.gitlabUsername || '',
       });
       state.gitlabMRs = mrs;
+    } catch (err) {
+      console.error('Erro ao buscar MRs do GitLab:', err);
     }
+  }
 
-    // Fetch Google Calendar Events & Google Tasks
-    if (state.config.googleCalId && state.config.googleToken) {
+  // Fetch Google Calendar Events & Google Tasks in isolated try/catch
+  if (state.config.googleCalId && state.config.googleToken) {
+    try {
+      const timeMinDate = new Date(state.currentDate.getFullYear() - 1, 0, 1);
+      const timeMinStr = timeMinDate.toISOString();
+
       const events = await invoke<GoogleEvent[]>('fetch_google_calendar_events', {
         calendarId: state.config.googleCalId,
         apiKeyOrToken: state.config.googleToken,
         clientId: state.config.googleClientId || null,
         clientSecret: state.config.googleClientSecret || null,
+        timeMin: timeMinStr,
       });
 
       try {
@@ -288,16 +305,17 @@ async function fetchAllData() {
       } catch (err) {
         state.googleEvents = events;
       }
+    } catch (err) {
+      console.error('Erro ao buscar eventos do Google Calendar:', err);
     }
-  } catch (e) {
-    console.warn('API Fetch returned warning/error, combining demo items if needed:', e);
-    if (state.gitlabIssues.length === 0 && state.googleEvents.length === 0) {
-      generateDemoData();
-    }
-  } finally {
-    if (syncBtn) syncBtn.classList.remove('loading');
-    updateUI();
   }
+
+  if (state.gitlabIssues.length === 0 && state.gitlabMRs.length === 0 && state.googleEvents.length === 0 && state.isDemoMode) {
+    generateDemoData();
+  }
+
+  if (syncBtn) syncBtn.classList.remove('loading');
+  updateUI();
 }
 
 // Update UI according to active view & date
@@ -305,6 +323,7 @@ function updateUI() {
   updateStatusBanner();
   updateDateTitle();
   updateNavTabStyles();
+  document.querySelector<HTMLElement>('.toolbar-bar')?.classList.toggle('hidden', ['schedule', 'notes', 'tasks', 'timer'].includes(state.currentView));
 
   if (state.currentView === 'monthly') {
     renderMonthlyGrid();
@@ -362,7 +381,11 @@ function updateDateTitle() {
     const startOfWeek = getStartOfWeek(state.currentDate);
     const endOfWeek = new Date(startOfWeek);
     endOfWeek.setDate(startOfWeek.getDate() + 6);
-    titleEl.textContent = `${startOfWeek.getDate()} - ${endOfWeek.getDate()} de ${monthNames[endOfWeek.getMonth()]} ${endOfWeek.getFullYear()}`;
+    if (startOfWeek.getMonth() === endOfWeek.getMonth()) {
+      titleEl.textContent = `${startOfWeek.getDate()} - ${endOfWeek.getDate()} de ${monthNames[endOfWeek.getMonth()]} ${endOfWeek.getFullYear()}`;
+    } else {
+      titleEl.textContent = `${startOfWeek.getDate()} de ${monthNames[startOfWeek.getMonth()]} - ${endOfWeek.getDate()} de ${monthNames[endOfWeek.getMonth()]} ${endOfWeek.getFullYear()}`;
+    }
   } else {
     titleEl.textContent = `${state.currentDate.getDate()} de ${monthNames[state.currentDate.getMonth()]} ${state.currentDate.getFullYear()}`;
   }
@@ -371,7 +394,15 @@ function updateDateTitle() {
 // Helper Date Functions
 function getEventDateStr(dateStr: string): string {
   if (!dateStr) return '';
-  const match = dateStr.match(/(\d{4}-\d{2}-\d{2})/);
+  const clean = dateStr.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) {
+    return clean;
+  }
+  const d = new Date(clean);
+  if (!isNaN(d.getTime())) {
+    return formatDateToStr(d);
+  }
+  const match = clean.match(/(\d{4}-\d{2}-\d{2})/);
   return match ? match[1] : '';
 }
 
@@ -382,16 +413,47 @@ function formatDateToStr(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
+function isAllDayEvent(dateStr: string): boolean {
+  if (!dateStr) return true;
+  const clean = dateStr.trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(clean);
+}
+
 function getEventDisplayTime(dateStr: string): string {
   if (!dateStr) return '';
-  const match = dateStr.match(/T(\d{2}):(\d{2})/);
-  if (match) {
-    if (match[1] === '12' && match[2] === '00' && dateStr.length === 19) {
-      return 'Dia todo';
-    }
-    return `${match[1]}:${match[2]}`;
+  const clean = dateStr.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) {
+    return 'Dia todo';
   }
-  return 'Dia todo';
+  const d = new Date(clean);
+  if (!isNaN(d.getTime())) {
+    const hours = String(d.getHours()).padStart(2, '0');
+    const minutes = String(d.getMinutes()).padStart(2, '0');
+    return `${hours}:${minutes}`;
+  }
+  const match = clean.match(/T(\d{2}):(\d{2})/);
+  return match ? `${match[1]}:${match[2]}` : 'Dia todo';
+}
+
+function getEventStartHourFraction(dateStr: string): number {
+  if (!dateStr || isAllDayEvent(dateStr)) return -1;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return -1;
+  return d.getHours() + d.getMinutes() / 60;
+}
+
+function getEventDurationMinutes(startTimeStr: string, endTimeStr?: string): number {
+  if (!startTimeStr || isAllDayEvent(startTimeStr)) return 60;
+  const start = new Date(startTimeStr);
+  if (isNaN(start.getTime())) return 60;
+  if (endTimeStr && !isAllDayEvent(endTimeStr)) {
+    const end = new Date(endTimeStr);
+    if (!isNaN(end.getTime()) && end.getTime() > start.getTime()) {
+      const diffMinutes = Math.round((end.getTime() - start.getTime()) / (1000 * 60));
+      return Math.max(20, Math.min(diffMinutes, 24 * 60));
+    }
+  }
+  return 60; // default 1 hour
 }
 
 function parseEventDate(dateStr: string): Date {
@@ -406,9 +468,10 @@ function parseEventDate(dateStr: string): Date {
 
 function getStartOfWeek(d: Date): Date {
   const date = new Date(d);
-  const day = date.getDay();
-  const diff = date.getDate() - day + (day === 0 ? -6 : 1); // Adjust for Monday start
-  return new Date(date.setDate(diff));
+  const day = date.getDay(); // 0 = Sunday
+  date.setDate(date.getDate() - day);
+  date.setHours(0, 0, 0, 0);
+  return date;
 }
 
 function isSameDay(d1: Date, d2: Date): boolean {
@@ -418,6 +481,79 @@ function isSameDay(d1: Date, d2: Date): boolean {
     d1.getMonth() === d2.getMonth() &&
     d1.getDate() === d2.getDate()
   );
+}
+
+interface UnifiedCalendarItem {
+  id: string;
+  type: 'google' | 'gitlab-issue' | 'gitlab-mr';
+  title: string;
+  description: string;
+  url?: string;
+  tags: string[];
+  isAllDay: boolean;
+  startHourFraction: number;
+  endHourFraction: number;
+  timeDisplay: string;
+  rawDate: Date;
+}
+
+function layoutTimedEvents(
+  timedEvents: UnifiedCalendarItem[]
+): { item: UnifiedCalendarItem; colIdx: number; totalCols: number }[] {
+  if (timedEvents.length === 0) return [];
+
+  timedEvents.sort((a, b) => a.startHourFraction - b.startHourFraction || b.endHourFraction - a.endHourFraction);
+
+  const results: { item: UnifiedCalendarItem; colIdx: number; totalCols: number }[] = [];
+  let cluster: UnifiedCalendarItem[] = [];
+  let clusterEnd = -1;
+
+  const flushCluster = (c: UnifiedCalendarItem[]) => {
+    if (c.length === 0) return;
+    const columns: number[] = [];
+    const placed: { item: UnifiedCalendarItem; colIdx: number }[] = [];
+
+    for (const ev of c) {
+      let placedCol = -1;
+      for (let i = 0; i < columns.length; i++) {
+        if (columns[i] <= ev.startHourFraction) {
+          columns[i] = ev.endHourFraction;
+          placedCol = i;
+          break;
+        }
+      }
+      if (placedCol === -1) {
+        columns.push(ev.endHourFraction);
+        placedCol = columns.length - 1;
+      }
+      placed.push({ item: ev, colIdx: placedCol });
+    }
+
+    const totalCols = columns.length;
+    for (const p of placed) {
+      results.push({ item: p.item, colIdx: p.colIdx, totalCols });
+    }
+  };
+
+  for (const ev of timedEvents) {
+    if (cluster.length === 0) {
+      cluster.push(ev);
+      clusterEnd = ev.endHourFraction;
+    } else if (ev.startHourFraction < clusterEnd) {
+      cluster.push(ev);
+      clusterEnd = Math.max(clusterEnd, ev.endHourFraction);
+    } else {
+      flushCluster(cluster);
+      cluster = [ev];
+      clusterEnd = ev.endHourFraction;
+    }
+  }
+
+  if (cluster.length > 0) {
+    flushCluster(cluster);
+  }
+
+  return results;
 }
 
 // ----------------------------------------------------
@@ -473,8 +609,14 @@ function renderMonthlyGrid() {
     const dayEvents = state.googleEvents.filter((ev) => {
       const evDateStr = getEventDateStr(ev.start_time);
       const matchesDay = evDateStr === cellDateStr;
-      const matchesQuery = !query || ev.summary.toLowerCase().includes(query);
+      const matchesQuery = !query || ev.summary.toLowerCase().includes(query) || (ev.description || '').toLowerCase().includes(query);
       return matchesDay && matchesQuery;
+    });
+
+    dayEvents.sort((a, b) => {
+      const tA = parseEventDate(a.start_time).getTime();
+      const tB = parseEventDate(b.start_time).getTime();
+      return tA - tB;
     });
 
     dayEvents.forEach((ev) => {
@@ -495,11 +637,17 @@ function renderMonthlyGrid() {
       return matchesDay && matchesQuery;
     });
 
+    dayIssues.sort((a, b) => {
+      const tA = parseEventDate(a.due_date || '').getTime();
+      const tB = parseEventDate(b.due_date || '').getTime();
+      return tA - tB;
+    });
+
     dayIssues.forEach((iss) => {
       const chip = document.createElement('div');
       chip.className = 'event-chip type-gitlab-issue';
       chip.innerHTML = `<span class="chip-time">#${iss.iid}</span> <span class="chip-title">${escapeHtml(iss.title)}</span>`;
-      chip.onclick = () => showItemDetail(`GitLab Issue #${iss.iid}`, iss.title, iss.description || '', iss.web_url, iss.labels);
+      chip.onclick = () => showItemDetail(`GitLab Issue #${iss.iid}`, iss.title, iss.description || '', iss.web_url, iss.labels, true);
       stack.appendChild(chip);
     });
 
@@ -513,18 +661,36 @@ function renderMonthlyGrid() {
 // ----------------------------------------------------
 function renderWeeklySchedule() {
   const headerContainer = document.getElementById('weekly-header');
+  const allDayRow = document.getElementById('weekly-all-day-row');
+  const timeColumn = document.getElementById('weekly-time-column');
   const daysGrid = document.getElementById('weekly-grid-days');
-  if (!headerContainer || !daysGrid) return;
+  const bodyScroll = document.getElementById('weekly-body-scroll');
 
-  headerContainer.innerHTML = '<div class="weekly-header-col"></div>';
+  if (!headerContainer || !daysGrid || !timeColumn) return;
+
+  headerContainer.innerHTML = '<div class="weekly-header-col time-col-header"><span>Hora</span></div>';
+  if (allDayRow) {
+    allDayRow.innerHTML = '<div class="all-day-label">Dia Todo</div>';
+  }
+  timeColumn.innerHTML = '';
   daysGrid.innerHTML = '';
 
+  const HOUR_HEIGHT = 56;
   const startOfWeek = getStartOfWeek(state.currentDate);
   const today = new Date();
   const weekDays: Date[] = [];
-
   const dayNames = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
 
+  // Render Time Labels (00:00 - 23:00)
+  for (let h = 0; h < 24; h++) {
+    const slot = document.createElement('div');
+    slot.className = 'time-slot';
+    slot.style.height = `${HOUR_HEIGHT}px`;
+    slot.textContent = `${String(h).padStart(2, '0')}:00`;
+    timeColumn.appendChild(slot);
+  }
+
+  // Render 7 Day Headers
   for (let i = 0; i < 7; i++) {
     const d = new Date(startOfWeek);
     d.setDate(startOfWeek.getDate() + i);
@@ -532,7 +698,7 @@ function renderWeeklySchedule() {
 
     const isToday = isSameDay(d, today);
     const colHeader = document.createElement('div');
-    colHeader.className = 'weekly-header-col';
+    colHeader.className = `weekly-header-col ${isToday ? 'today' : ''}`;
     colHeader.innerHTML = `
       <div class="weekly-day-name">${dayNames[d.getDay()]}</div>
       <div class="weekly-day-num ${isToday ? 'today' : ''}">${d.getDate()}</div>
@@ -540,46 +706,175 @@ function renderWeeklySchedule() {
     headerContainer.appendChild(colHeader);
   }
 
-  // Render 7 Day Columns
+  const query = state.searchQuery.toLowerCase();
+
+  // Render 7 Days Columns & All-Day Row
   weekDays.forEach((date) => {
+    const targetDateStr = formatDateToStr(date);
+    const dayItems: UnifiedCalendarItem[] = [];
+
+    // 1. Google Events
+    state.googleEvents.forEach((ev) => {
+      const evDateStr = getEventDateStr(ev.start_time);
+      if (evDateStr !== targetDateStr) return;
+
+      const matchesQuery =
+        !query ||
+        ev.summary.toLowerCase().includes(query) ||
+        (ev.description || '').toLowerCase().includes(query) ||
+        (ev.location || '').toLowerCase().includes(query);
+      if (!matchesQuery) return;
+
+      const isAllDay = isAllDayEvent(ev.start_time);
+      const startHour = isAllDay ? -1 : getEventStartHourFraction(ev.start_time);
+      const duration = isAllDay ? 0 : getEventDurationMinutes(ev.start_time, ev.end_time);
+
+      dayItems.push({
+        id: ev.id,
+        type: 'google',
+        title: ev.summary,
+        description: ev.description || '',
+        url: ev.html_link,
+        tags: [ev.location || 'Google Agenda'],
+        isAllDay,
+        startHourFraction: startHour,
+        endHourFraction: isAllDay ? -1 : startHour + duration / 60,
+        timeDisplay: getEventDisplayTime(ev.start_time),
+        rawDate: parseEventDate(ev.start_time),
+      });
+    });
+
+    // 2. GitLab Issues
+    state.gitlabIssues.forEach((iss) => {
+      if (!iss.due_date) return;
+      const issDateStr = getEventDateStr(iss.due_date);
+      if (issDateStr !== targetDateStr) return;
+
+      const matchesQuery =
+        !query ||
+        iss.title.toLowerCase().includes(query) ||
+        (iss.description || '').toLowerCase().includes(query) ||
+        iss.labels.some((l) => l.toLowerCase().includes(query));
+      if (!matchesQuery) return;
+
+      const isAllDay = isAllDayEvent(iss.due_date);
+      const startHour = isAllDay ? -1 : getEventStartHourFraction(iss.due_date);
+      const duration = isAllDay ? 0 : 60;
+
+      dayItems.push({
+        id: `iss-${iss.id}`,
+        type: 'gitlab-issue',
+        title: `#${iss.iid} ${iss.title}`,
+        description: iss.description || '',
+        url: iss.web_url,
+        tags: iss.labels,
+        isAllDay,
+        startHourFraction: startHour,
+        endHourFraction: isAllDay ? -1 : startHour + duration / 60,
+        timeDisplay: isAllDay ? 'Dia todo' : getEventDisplayTime(iss.due_date),
+        rawDate: parseEventDate(iss.due_date),
+      });
+    });
+
+    // Separate all-day vs timed
+    const allDayItems = dayItems.filter((item) => item.isAllDay);
+    const timedItems = dayItems.filter((item) => !item.isAllDay);
+
+    // Sort all-day items alphabetically
+    allDayItems.sort((a, b) => a.title.localeCompare(b.title));
+
+    // Sort timed items chronologically
+    timedItems.sort((a, b) => a.startHourFraction - b.startHourFraction || a.rawDate.getTime() - b.rawDate.getTime());
+
+    // 3. Render All-Day Cell
+    if (allDayRow) {
+      const allDayCell = document.createElement('div');
+      allDayCell.className = 'all-day-cell';
+      allDayItems.forEach((item) => {
+        const chip = document.createElement('div');
+        chip.className = `event-chip type-${item.type} all-day-chip`;
+        chip.innerHTML = `<span class="chip-title">${escapeHtml(item.title)}</span>`;
+        chip.onclick = () =>
+          showItemDetail(
+            item.type === 'google' ? 'Google Agenda' : 'GitLab Issue',
+            item.title,
+            item.description,
+            item.url,
+            item.tags,
+            item.type !== 'google'
+          );
+        allDayCell.appendChild(chip);
+      });
+      allDayRow.appendChild(allDayCell);
+    }
+
+    // 4. Render Day Column with Hour Grid and Timed Events
     const col = document.createElement('div');
     col.className = 'weekly-day-column';
-    const targetDateStr = formatDateToStr(date);
+    col.style.height = `${24 * HOUR_HEIGHT}px`;
 
-    // 7 hour slots
-    for (let h = 8; h <= 20; h += 2) {
+    // 24 Hour Grid Lines
+    for (let h = 0; h < 24; h++) {
       const cell = document.createElement('div');
       cell.className = 'weekly-hour-cell';
+      cell.style.height = `${HOUR_HEIGHT}px`;
       col.appendChild(cell);
     }
 
-    // Add Events for this day
-    state.googleEvents.forEach((ev) => {
-      const evDateStr = getEventDateStr(ev.start_time);
-      if (evDateStr === targetDateStr) {
-        const chip = document.createElement('div');
-        chip.className = 'event-chip type-google';
-        chip.style.margin = '6px';
-        const timeStr = getEventDisplayTime(ev.start_time);
-        chip.innerHTML = `<span class="chip-title">${timeStr} - ${escapeHtml(ev.summary)}</span>`;
-        chip.onclick = () => showItemDetail('Google Agenda', ev.summary, ev.description || '', ev.html_link, [ev.location || '']);
-        col.appendChild(chip);
-      }
-    });
+    // Current Time Line (if today)
+    if (isSameDay(date, today)) {
+      const now = new Date();
+      const currentMinutes = now.getHours() * 60 + now.getMinutes();
+      const lineTop = (currentMinutes / 60) * HOUR_HEIGHT;
+      const timeIndicator = document.createElement('div');
+      timeIndicator.className = 'current-time-line';
+      timeIndicator.style.top = `${lineTop}px`;
+      col.appendChild(timeIndicator);
+    }
 
-    state.gitlabIssues.forEach((iss) => {
-      if (iss.due_date && getEventDateStr(iss.due_date) === targetDateStr) {
-        const chip = document.createElement('div');
-        chip.className = 'event-chip type-gitlab-issue';
-        chip.style.margin = '6px';
-        chip.innerHTML = `<span class="chip-title">#${iss.iid} ${escapeHtml(iss.title)}</span>`;
-        chip.onclick = () => showItemDetail(`GitLab Issue #${iss.iid}`, iss.title, iss.description || '', iss.web_url, iss.labels);
-        col.appendChild(chip);
-      }
+    // Position Timed Events
+    const layouted = layoutTimedEvents(timedItems);
+    layouted.forEach(({ item, colIdx, totalCols }) => {
+      const top = item.startHourFraction * HOUR_HEIGHT;
+      const durationHours = Math.max(0.5, item.endHourFraction - item.startHourFraction);
+      const height = Math.max(26, durationHours * HOUR_HEIGHT - 3);
+
+      const widthPercent = 100 / totalCols;
+      const leftPercent = colIdx * widthPercent;
+
+      const chip = document.createElement('div');
+      chip.className = `event-chip weekly-timed type-${item.type}`;
+      chip.style.top = `${top}px`;
+      chip.style.height = `${height}px`;
+      chip.style.left = `calc(${leftPercent}% + 2px)`;
+      chip.style.width = `calc(${widthPercent}% - 4px)`;
+
+      chip.innerHTML = `
+        <div class="weekly-chip-content">
+          <span class="chip-time">${item.timeDisplay}</span>
+          <span class="chip-title">${escapeHtml(item.title)}</span>
+        </div>
+      `;
+      chip.onclick = () =>
+        showItemDetail(
+          item.type === 'google' ? 'Google Agenda' : 'GitLab Issue',
+          item.title,
+          item.description,
+          item.url,
+          item.tags,
+          item.type !== 'google'
+        );
+      col.appendChild(chip);
     });
 
     daysGrid.appendChild(col);
   });
+
+  // Auto-scroll to morning (~07:00) on first weekly view activation
+  if (bodyScroll && !bodyScroll.dataset.scrolled) {
+    bodyScroll.scrollTop = 7 * HOUR_HEIGHT;
+    bodyScroll.dataset.scrolled = 'true';
+  }
 }
 
 // ----------------------------------------------------
@@ -638,7 +933,7 @@ function renderDailyTimeline() {
   gitlabItems.forEach((item) => {
     const card = document.createElement('div');
     card.className = 'kanban-card';
-    const isIssue = 'iid' in item && 'due_date' in item;
+    const isIssue = !('draft' in item);
     const title = item.title;
     const iid = item.iid;
     card.innerHTML = `
@@ -648,7 +943,7 @@ function renderDailyTimeline() {
       </div>
       <div class="card-title">${escapeHtml(title)}</div>
     `;
-    card.onclick = () => showItemDetail(isIssue ? `Issue #${iid}` : `MR #${iid}`, title, item.description || '', item.web_url, item.labels);
+    card.onclick = () => showItemDetail(isIssue ? `Issue #${iid}` : `MR #${iid}`, title, item.description || '', item.web_url, item.labels, true);
     gitlabList.appendChild(card);
   });
 }
@@ -736,7 +1031,7 @@ function renderGitlabBoard() {
       </div>
     `;
 
-    card.onclick = () => showItemDetail(`${activeTab === 'issues' ? 'Issue' : 'MR'} #${item.iid}`, item.title, item.description || '', item.web_url, item.labels);
+    card.onclick = () => showItemDetail(`${activeTab === 'issues' ? 'Issue' : 'MR'} #${item.iid}`, item.title, item.description || '', item.web_url, item.labels, true);
 
     if (column === 'todo') cardsTodo.appendChild(card);
     else if (column === 'doing') cardsDoing.appendChild(card);
@@ -753,7 +1048,7 @@ function renderGitlabBoard() {
 // ----------------------------------------------------
 // MODALS & EVENT HANDLERS
 // ----------------------------------------------------
-function showItemDetail(badge: string, title: string, description: string, url?: string, tags: string[] = []) {
+function showItemDetail(badge: string, title: string, description: string, url?: string, tags: string[] = [], markdown = false) {
   const modal = document.getElementById('modal-item-detail');
   const badgeEl = document.getElementById('detail-badge');
   const titleEl = document.getElementById('detail-title');
@@ -765,7 +1060,13 @@ function showItemDetail(badge: string, title: string, description: string, url?:
 
   if (badgeEl) badgeEl.textContent = badge;
   if (titleEl) titleEl.textContent = title;
-  if (descEl) descEl.textContent = description || 'Sem descrição detalhada fornecida.';
+  if (descEl) {
+    const text = description || 'Sem descrição detalhada fornecida.';
+    descEl.classList.toggle('markdown-body', markdown);
+    descEl.onclick = null;
+    if (markdown) renderMarkdown(descEl, text, gitlabProjectUrl(url));
+    else descEl.textContent = text;
+  }
 
   if (tagsEl) {
     tagsEl.innerHTML = tags.map((t) => `<span class="tag-pill doing">${escapeHtml(t)}</span>`).join(' ');
@@ -795,11 +1096,35 @@ function escapeHtml(str: string): string {
 
 // Setup Event Listeners
 function setupEventListeners() {
+  const navGroups = Array.from(document.querySelectorAll<HTMLElement>('.nav-group'));
+  let activeNavGroup = Math.max(0, navGroups.findIndex((group) => !group.hidden));
+
+  const showNavGroup = (index: number, openFirstView = false) => {
+    activeNavGroup = (index + navGroups.length) % navGroups.length;
+    navGroups.forEach((group, groupIndex) => {
+      const active = groupIndex === activeNavGroup;
+      group.hidden = !active;
+      group.classList.toggle('active', active);
+    });
+    if (openFirstView) {
+      const firstView = navGroups[activeNavGroup].querySelector<HTMLElement>('.tab-btn')?.dataset.view as AppState['currentView'] | undefined;
+      if (firstView) {
+        state.currentView = firstView;
+        updateUI();
+      }
+    }
+  };
+
+  document.getElementById('nav-group-prev')?.addEventListener('click', () => showNavGroup(activeNavGroup - 1, true));
+  document.getElementById('nav-group-next')?.addEventListener('click', () => showNavGroup(activeNavGroup + 1, true));
+
   // Navigation Tabs
   document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const view = btn.getAttribute('data-view') as AppState['currentView'];
       if (view) {
+        const groupIndex = navGroups.indexOf(btn.closest<HTMLElement>('.nav-group')!);
+        if (groupIndex >= 0) showNavGroup(groupIndex);
         state.currentView = view;
         updateUI();
       }
@@ -874,19 +1199,19 @@ function setupEventListeners() {
 
   // Save Settings Form
   document.getElementById('btn-save-settings')?.addEventListener('click', () => {
-    const host = (document.getElementById('cfg-gitlab-host') as HTMLInputElement).value;
-    const token = (document.getElementById('cfg-gitlab-token') as HTMLInputElement).value;
-    const user = (document.getElementById('cfg-gitlab-username') as HTMLInputElement).value;
-    const calId = (document.getElementById('cfg-google-cal-id') as HTMLInputElement).value;
-    const gToken = (document.getElementById('cfg-google-token') as HTMLInputElement).value;
-    const gClientId = (document.getElementById('cfg-google-client-id') as HTMLInputElement).value;
-    const gClientSecret = (document.getElementById('cfg-google-client-secret') as HTMLInputElement).value;
+    const host = (document.getElementById('cfg-gitlab-host') as HTMLInputElement).value.trim();
+    const token = (document.getElementById('cfg-gitlab-token') as HTMLInputElement).value.trim();
+    const user = (document.getElementById('cfg-gitlab-username') as HTMLInputElement).value.trim();
+    const calId = (document.getElementById('cfg-google-cal-id') as HTMLInputElement).value.trim();
+    const gToken = (document.getElementById('cfg-google-token') as HTMLInputElement).value.trim();
+    const gClientId = (document.getElementById('cfg-google-client-id') as HTMLInputElement).value.trim();
+    const gClientSecret = (document.getElementById('cfg-google-client-secret') as HTMLInputElement).value.trim();
 
     state.saveConfig({
       gitlabHost: host,
       gitlabToken: token,
       gitlabUsername: user,
-      googleCalId: calId,
+      googleCalId: calId || 'primary',
       googleToken: gToken,
       googleClientId: gClientId,
       googleClientSecret: gClientSecret,
@@ -906,12 +1231,12 @@ function setupEventListeners() {
 
   // Test GitLab Connection
   document.getElementById('btn-test-gitlab')?.addEventListener('click', async () => {
-    const host = (document.getElementById('cfg-gitlab-host') as HTMLInputElement).value;
-    const token = (document.getElementById('cfg-gitlab-token') as HTMLInputElement).value;
+    const host = (document.getElementById('cfg-gitlab-host') as HTMLInputElement).value.trim();
+    const token = (document.getElementById('cfg-gitlab-token') as HTMLInputElement).value.trim();
     const resultSpan = document.getElementById('test-gitlab-result');
 
     if (!resultSpan) return;
-    resultSpan.textContent = 'Testando...';
+    resultSpan.textContent = 'Testando conexão...';
     resultSpan.className = 'test-result';
 
     if (!isTauriAvailable()) {
@@ -932,14 +1257,14 @@ function setupEventListeners() {
 
   // Test Google Calendar Connection
   document.getElementById('btn-test-google')?.addEventListener('click', async () => {
-    const calId = (document.getElementById('cfg-google-cal-id') as HTMLInputElement).value;
-    const token = (document.getElementById('cfg-google-token') as HTMLInputElement).value;
-    const clientId = (document.getElementById('cfg-google-client-id') as HTMLInputElement).value;
-    const clientSecret = (document.getElementById('cfg-google-client-secret') as HTMLInputElement).value;
+    const calId = (document.getElementById('cfg-google-cal-id') as HTMLInputElement).value.trim();
+    const token = (document.getElementById('cfg-google-token') as HTMLInputElement).value.trim();
+    const clientId = (document.getElementById('cfg-google-client-id') as HTMLInputElement).value.trim();
+    const clientSecret = (document.getElementById('cfg-google-client-secret') as HTMLInputElement).value.trim();
     const resultSpan = document.getElementById('test-google-result');
 
     if (!resultSpan) return;
-    resultSpan.textContent = 'Testando...';
+    resultSpan.textContent = 'Testando conexão...';
     resultSpan.className = 'test-result';
 
     if (!isTauriAvailable()) {
@@ -949,11 +1274,13 @@ function setupEventListeners() {
     }
 
     try {
+      const timeMinDate = new Date(state.currentDate.getFullYear() - 1, 0, 1);
       const res = await invoke<string>('test_google_connection', {
-        calendarId: calId,
+        calendarId: calId || 'primary',
         apiKeyOrToken: token,
         clientId: clientId || null,
         clientSecret: clientSecret || null,
+        timeMin: timeMinDate.toISOString(),
       });
       resultSpan.textContent = res;
       resultSpan.className = 'test-result success';
@@ -1001,5 +1328,9 @@ function populateSettingsForm() {
 // Initialization
 document.addEventListener('DOMContentLoaded', () => {
   setupEventListeners();
+  setupNotes();
+  setupTasks();
+  setupSchedule();
+  setupTimer();
   fetchAllData();
 });

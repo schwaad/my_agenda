@@ -4,20 +4,31 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "start": "tauri dev",
+    "debug": "tauri dev",
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:debug": "tauri build --debug --no-bundle && cp src-tauri/target/debug/tauri-app ./my_agenda-debug && chmod +x ./my_agenda-debug",
+    "build:release": "tauri build --no-bundle && cp src-tauri/target/release/tauri-app ./my_agenda && chmod +x ./my_agenda",
+    "build:official": "tauri build",
+    "build:bin": "npm run build:release",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "WEBKIT_DISABLE_COMPOSITING_MODE=1 tauri dev",
-    "tauri:hyprland": "GDK_BACKEND=wayland,x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 tauri dev"
+    "tauri:build": "npm run build:release",
+    "tauri:hyprland": "GDK_BACKEND=wayland,x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 tauri dev",
+    "test": "node --experimental-strip-types tests/markdown-notes.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
-    "lucide": "^1.47.0"
+    "dompurify": "^3.4.15",
+    "lucide": "^1.47.0",
+    "marked": "^18.0.13"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "jsdom": "^29.1.1",
     "typescript": "~6.0.3",
     "vite": "^8.0.16"
   }

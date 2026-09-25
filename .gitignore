@@ -12,6 +12,39 @@ dist
 dist-ssr
 *.local
 
+# Environment files and local configuration
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Credentials, private keys and secret material
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+credentials.json
+credentials.*.json
+secrets.*
+secrets/
+**/secrets/
+.aws/
+**/.aws/
+.ssh/
+**/.ssh/
+
+# Test coverage and temporary files
+coverage/
+.nyc_output/
+tmp/
+temp/
+*.tmp
+*.bak
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -22,3 +55,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local application binaries and debug artifacts
+my_agenda
+my_agenda-*
+*.debug
+*.dSYM/
